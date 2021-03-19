@@ -3,28 +3,38 @@ import EventSource = require('eventsource')
 import superagent = require('superagent')
 import url = require('url')
 import querystring = require('querystring')
+import crypto = require('crypto')
 
 type Severity = 'info' | 'error'
 
 interface Options {
   source: string
   target: string
+  secret: string
   logger?: Pick<Console, Severity>
 }
 
 class Client {
   source: string;
   target: string;
+  secret: string;
   logger: Pick<Console, Severity>;
   events!: EventSource;
 
-  constructor ({ source, target, logger = console }: Options) {
+  constructor ({ source, target, secret, logger = console }: Options) {
     this.source = source
     this.target = target
+    this.secret = secret
     this.logger = logger!
 
     if (!validator.isURL(this.source)) {
       throw new Error('The provided URL is invalid.')
+    }
+
+    if (this.secret) {
+      this.logger.info('Secret supplied, will recalculate signatures.')
+    } else {
+      this.logger.info('Secret NOT supplied, will NOT recalculate signatures.')
     }
   }
 
@@ -32,6 +42,35 @@ class Client {
     return superagent.head('https://smee.io/new').redirects(0).catch((err) => {
       return err.response.headers.location
     })
+  }
+
+  sign (secret: any, blob: any) {
+    var hmac
+    hmac = crypto.createHmac('sha1', secret).update(Buffer.from(blob, 'utf-8')).digest('hex');
+    return 'sha1=' + hmac;
+  }
+
+  sign256 (secret: any, blob: any) {
+    var hmac 
+    hmac = crypto.createHmac('sha256', secret).update(Buffer.from(blob, 'utf-8')).digest('hex');
+    return 'sha256=' + hmac;
+  }
+
+  recalculateSignatureIfPresent (data: any) {
+    const originalSignature = data["x-hub-signature"]
+    const originalSignature256 = data["x-hub-signature-256"]
+    const blob = JSON.stringify(data.body);
+
+    if (originalSignature && this.secret && blob) {
+      const signature = this.sign(this.secret, blob);
+      const signature256 = this.sign256(this.secret, blob);
+
+      this.logger.info(`Recalculated signature: ${originalSignature} -> ${signature}`)
+      this.logger.info(`Recalculated signature 256: ${originalSignature256} -> ${signature256}`)
+
+      data["x-hub-signature"] = signature
+      data["x-hub-signature-256"] = signature256
+    }
   }
 
   onmessage (msg: any) {
@@ -45,6 +84,8 @@ class Client {
 
     // Remove the host header, leaving it causes issues with SNI and TLS verification
     delete data.host
+
+    this.recalculateSignatureIfPresent(data)
 
     const req = superagent.post(url.format(target)).send(data.body)
 
